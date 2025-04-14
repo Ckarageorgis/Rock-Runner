@@ -1041,6 +1041,10 @@ void AnimationTrackEditTypeAudio::drop_data(const Point2 &p_point, const Variant
 void AnimationTrackEditTypeAudio::gui_input(const Ref<InputEvent> &p_event) {
 	ERR_FAIL_COND(p_event.is_null());
 
+	if (get_editor()->get_scale_control()->is_visible()) {
+		return;
+	}
+
 	Ref<InputEventMouseMotion> mm = p_event;
 	if (!len_resizing && mm.is_valid()) {
 		bool use_hsize_cursor = false;
@@ -1175,10 +1179,10 @@ void AnimationTrackEditTypeAudio::gui_input(const Ref<InputEvent> &p_event) {
 }
 
 Control::CursorShape AnimationTrackEditTypeAudio::get_cursor_shape(const Point2 &p_pos) const {
-	if (over_drag_position || len_resizing) {
+	if ((over_drag_position || len_resizing) && !get_editor()->get_scale_control()->is_visible()) {
 		return Control::CURSOR_HSIZE;
 	} else {
-		return get_default_cursor_shape();
+		return AnimationTrackEdit::get_cursor_shape(p_pos);
 	}
 }
 
