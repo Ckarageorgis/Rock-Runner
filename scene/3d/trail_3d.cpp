@@ -182,7 +182,9 @@ void Trail3D::_notification(int p_what) {
 
 void Trail3D::set_width(float p_width) {
 	width = p_width;
-	_needs_rebuilding = true;
+	if (limit_mode == LIMIT_MODE_MAX_LENGTH && !RS::get_singleton()->is_connected("frame_pre_draw", callable_mp(this, &Trail3D::_process_trail))) {
+		RS::get_singleton()->connect("frame_pre_draw", callable_mp(this, &Trail3D::_process_trail), CONNECT_ONE_SHOT);
+	}
 }
 
 float Trail3D::get_width() const {
@@ -219,8 +221,10 @@ Ref<Curve> Trail3D::get_width_curve() const {
 }
 
 void Trail3D::set_color(const Color &p_color) {
-	if (p_color != color) {
-		_needs_rebuilding = true;
+	if (p_color != color && limit_mode == LIMIT_MODE_MAX_LENGTH) {
+		if (!RS::get_singleton()->is_connected("frame_pre_draw", callable_mp(this, &Trail3D::_process_trail))) {
+			RS::get_singleton()->connect("frame_pre_draw", callable_mp(this, &Trail3D::_process_trail), CONNECT_ONE_SHOT);
+		}
 	}
 	color = p_color;
 }
@@ -504,31 +508,33 @@ void Trail3D::_do_rebuild() {
 	for (int i = 0; i < points_count - 1; i++) {
 		int j = i * 12;
 		uint16_t k = (uint16_t)i * 3;
-
-		uint16_t idx = k;
+		uint16_t idx = k + 1;
 
 		*(uint16_t *)&index_write_buffer[j * 2] = idx;
 		idx = k + 3;
 		*(uint16_t *)&index_write_buffer[(j + 1) * 2] = idx;
-		idx = k + 1;
+		idx = k;
 		*(uint16_t *)&index_write_buffer[(j + 2) * 2] = idx;
-		idx = k + 1;
+
+		idx = k + 4;
 		*(uint16_t *)&index_write_buffer[(j + 3) * 2] = idx;
 		idx = k + 3;
 		*(uint16_t *)&index_write_buffer[(j + 4) * 2] = idx;
-		idx = k + 4;
-		*(uint16_t *)&index_write_buffer[(j + 5) * 2] = idx;
 		idx = k + 1;
+		*(uint16_t *)&index_write_buffer[(j + 5) * 2] = idx;
+
+		idx = k + 2;
 		*(uint16_t *)&index_write_buffer[(j + 6) * 2] = idx;
 		idx = k + 4;
 		*(uint16_t *)&index_write_buffer[(j + 7) * 2] = idx;
-		idx = k + 2;
+		idx = k + 1;
 		*(uint16_t *)&index_write_buffer[(j + 8) * 2] = idx;
-		idx = k + 2;
+
+		idx = k + 5;
 		*(uint16_t *)&index_write_buffer[(j + 9) * 2] = idx;
 		idx = k + 4;
 		*(uint16_t *)&index_write_buffer[(j + 10) * 2] = idx;
-		idx = k + 5;
+		idx = k + 2;
 		*(uint16_t *)&index_write_buffer[(j + 11) * 2] = idx;
 	}
 
