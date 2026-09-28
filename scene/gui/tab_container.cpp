@@ -320,6 +320,14 @@ void TabContainer::_repaint_internal() {
 	}
 
 	updating_visibility = true;
+	// First hide all non-current controls, so that visibility order does not depend on tab order.
+	for (int i = 0; i < controls.size(); i++) {
+		Control *c = controls[i];
+		if (i != current) {
+			c->hide();
+		}
+	}
+	// Then show the current control.
 	for (int i = 0; i < controls.size(); i++) {
 		Control *c = controls[i];
 
@@ -339,8 +347,6 @@ void TabContainer::_repaint_internal() {
 			c->set_offset(SIDE_LEFT, c->get_offset(SIDE_LEFT) + theme_cache.panel_style->get_margin(SIDE_LEFT));
 			c->set_offset(SIDE_RIGHT, c->get_offset(SIDE_RIGHT) - theme_cache.panel_style->get_margin(SIDE_RIGHT));
 			c->set_offset(SIDE_BOTTOM, c->get_offset(SIDE_BOTTOM) - theme_cache.panel_style->get_margin(SIDE_BOTTOM));
-		} else {
-			c->hide();
 		}
 	}
 	updating_visibility = false;
