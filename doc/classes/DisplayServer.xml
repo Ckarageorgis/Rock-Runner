@@ -2572,7 +2572,7 @@
 				[/csharp]
 				[/codeblocks]
 				[b]Note:[/b] On Windows, the portion of a window that lies outside the region is not drawn, while on Linux (X11) and macOS it is.
-				[b]Note:[/b] This method is implemented on Linux (X11), macOS and Windows.
+				[b]Note:[/b] This method is implemented on Linux (X11/Wayland), macOS and Windows.
 			</description>
 		</method>
 		<method name="window_set_popup_safe_rect">
@@ -3372,7 +3372,7 @@
 		</constant>
 		<constant name="WINDOW_FLAG_MOUSE_PASSTHROUGH" value="7" enum="WindowFlags">
 			All mouse events are passed to the underlying window of the same application.
-			[b]Note:[/b] This flag is implemented on Linux (X11), macOS, and Windows.
+			[b]Note:[/b] This flag is implemented on Linux (X11/Wayland), macOS, and Windows.
 		</constant>
 		<constant name="WINDOW_FLAG_SHARP_CORNERS" value="8" enum="WindowFlags">
 			Window style is overridden, forcing sharp corners.
