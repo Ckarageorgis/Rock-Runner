@@ -43,14 +43,15 @@ struct StringName::Table {
 	static inline _Data *table[TABLE_LEN];
 	static inline BinaryMutex mutex;
 	static inline PagedAllocator<_Data> allocator;
+	static inline bool configured = false;
 };
 
 void StringName::setup() {
-	ERR_FAIL_COND(configured);
+	ERR_FAIL_COND(Table::configured);
 	for (uint32_t i = 0; i < Table::TABLE_LEN; i++) {
 		Table::table[i] = nullptr;
 	}
-	configured = true;
+	Table::configured = true;
 }
 
 void StringName::cleanup() {
@@ -105,11 +106,16 @@ void StringName::cleanup() {
 	if (lost_strings) {
 		print_verbose(vformat("StringName: %d unclaimed string names at exit.", lost_strings));
 	}
-	configured = false;
+	Table::configured = false;
 }
 
 void StringName::unref() {
-	ERR_FAIL_COND(!configured);
+	if (unlikely(!Table::configured)) {
+		// Most likely tearing down. It's possible someone is genuinely
+		// misusing StringName, but they'll hopefully know soon enough
+		// without us printing because something down the line breaks.
+		return;
+	}
 
 	if (_data && _data->refcount.unref()) {
 		MutexLock lock(Table::mutex);
@@ -196,7 +202,7 @@ StringName &StringName::operator=(const StringName &p_name) {
 StringName::StringName(const StringName &p_name) {
 	_data = nullptr;
 
-	ERR_FAIL_COND(!configured);
+	ERR_FAIL_COND(!Table::configured);
 
 	if (p_name._data && p_name._data->refcount.ref()) {
 		_data = p_name._data;
@@ -206,7 +212,7 @@ StringName::StringName(const StringName &p_name) {
 StringName::StringName(const char *p_name, bool p_static) {
 	_data = nullptr;
 
-	ERR_FAIL_COND(!configured);
+	ERR_FAIL_COND(!Table::configured);
 
 	if (!p_name || p_name[0] == 0) {
 		return; //empty, ignore
@@ -263,7 +269,7 @@ StringName::StringName(const char *p_name, bool p_static) {
 StringName::StringName(const String &p_name, bool p_static) {
 	_data = nullptr;
 
-	ERR_FAIL_COND(!configured);
+	ERR_FAIL_COND(!Table::configured);
 
 	if (p_name.is_empty()) {
 		return;
