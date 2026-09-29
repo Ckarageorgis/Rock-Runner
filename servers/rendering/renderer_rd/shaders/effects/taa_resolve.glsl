@@ -38,8 +38,14 @@
 #define FLT_MAX 32767.0
 #define RPC_9 0.11111111111
 #define RPC_16 0.0625
+#define MAX_ACCUMULATED_SAMPLES 16.0
 
 #define DISOCCLUSION_SCALE 0.01 // Scale the weight of this pixel calculated as (change in velocity - threshold) * scale.
+
+// motion-adaptive variance box size
+// See Intel MiniEngine TAAResolve.hlsl and Karis "High Quality Temporal Supersampling"
+#define MIN_VARIANCE_BOX_SIZE_MULTIPLIER 0.4
+#define VELOCITY_CONFIDENCE_DISTANCE (128.0 / 1080.0) // 128 at 1080p, store it resolution independent
 
 layout(local_size_x = GROUP_SIZE, local_size_y = GROUP_SIZE, local_size_z = 1) in;
 
@@ -47,8 +53,9 @@ layout(rgba16f, set = 0, binding = 0) uniform restrict readonly image2D color_bu
 layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
 layout(rg16f, set = 0, binding = 2) uniform restrict readonly image2D velocity_buffer;
 layout(rg16f, set = 0, binding = 3) uniform restrict readonly image2D last_velocity_buffer;
-layout(set = 0, binding = 4) uniform sampler2D history_buffer;
-layout(rgba16f, set = 0, binding = 5) uniform restrict writeonly image2D output_buffer;
+layout(set = 0, binding = 4) uniform sampler2D history_buffer; // .rgb = HDR color, .a = accumulated sample count
+layout(rgba16f, set = 0, binding = 5) uniform restrict writeonly image2D output_buffer; // .rgb = HDR color, .a = accumulated sample count
+layout(rg16f, set = 0, binding = 6) uniform restrict writeonly image2D output_prev_velocity_buffer;
 
 layout(push_constant, std430) uniform Params {
 	vec2 resolution;
@@ -67,6 +74,18 @@ const ivec2 kOffsets3x3[9] = {
 	ivec2(-1, 1),
 	ivec2(0, 1),
 	ivec2(1, 1),
+};
+
+const float kWeights3x3[9] = {
+	1.0,
+	2.0,
+	1.0,
+	2.0,
+	2.5,
+	2.0,
+	1.0,
+	2.0,
+	1.0,
 };
 
 /*------------------------------------------------------------------------------
@@ -89,33 +108,27 @@ float get_depth(ivec2 thread_id) {
 	return texelFetch(depth_buffer, thread_id, 0).r;
 }
 
-shared vec3 tile_color[kTileDimension][kTileDimension];
-shared float tile_depth[kTileDimension][kTileDimension];
+// Contains color and depth
+shared vec4 tile_data[kTileDimension][kTileDimension];
 
-vec3 load_color(uvec2 group_thread_id) {
+vec3 load_color(ivec2 group_thread_id) {
 	group_thread_id += kBorderSize;
-	return tile_color[group_thread_id.x][group_thread_id.y];
+	return tile_data[group_thread_id.x][group_thread_id.y].rgb;
 }
 
-void store_color(uvec2 group_thread_id, vec3 color) {
-	tile_color[group_thread_id.x][group_thread_id.y] = color;
-}
-
-float load_depth(uvec2 group_thread_id) {
+float load_depth(ivec2 group_thread_id) {
 	group_thread_id += kBorderSize;
-	return tile_depth[group_thread_id.x][group_thread_id.y];
-}
-
-void store_depth(uvec2 group_thread_id, float depth) {
-	tile_depth[group_thread_id.x][group_thread_id.y] = depth;
+	return tile_data[group_thread_id.x][group_thread_id.y].a;
 }
 
 void store_color_depth(uvec2 group_thread_id, ivec2 thread_id) {
 	// out of bounds clamp
 	thread_id = clamp(thread_id, ivec2(0, 0), ivec2(params.resolution) - ivec2(1, 1));
 
-	store_color(group_thread_id, imageLoad(color_buffer, thread_id).rgb);
-	store_depth(group_thread_id, get_depth(thread_id));
+	// Run everything in reinhard
+	vec3 color = reinhard(imageLoad(color_buffer, thread_id).rgb);
+	float depth = get_depth(thread_id);
+	tile_data[group_thread_id.x][group_thread_id.y] = vec4(color, depth);
 }
 
 void populate_group_shared_memory(uvec2 group_id, uint group_index) {
@@ -142,19 +155,24 @@ void populate_group_shared_memory(uvec2 group_id, uint group_index) {
 								VELOCITY
 ------------------------------------------------------------------------------*/
 
-void depth_test_min(uvec2 pos, inout float min_depth, inout uvec2 min_pos) {
+void depth_test_min(ivec2 pos, inout float min_depth, inout ivec2 min_pos) {
 	float depth = load_depth(pos);
 
-	if (depth < min_depth) {
+	// prefer non sky pixels to get real geometry velocity
+	if (depth <= 0.0000001) {
+		return;
+	}
+
+	if (depth > min_depth) {
 		min_depth = depth;
 		min_pos = pos;
 	}
 }
 
 // Returns velocity with closest depth (3x3 neighborhood)
-void get_closest_pixel_velocity_3x3(in uvec2 group_pos, uvec2 group_top_left, out vec2 velocity) {
+void get_closest_pixel_velocity_3x3(in ivec2 group_pos, uvec2 group_top_left, out vec2 velocity) {
 	float min_depth = 1.0;
-	uvec2 min_pos = group_pos;
+	ivec2 min_pos = group_pos;
 
 	depth_test_min(group_pos + kOffsets3x3[0], min_depth, min_pos);
 	depth_test_min(group_pos + kOffsets3x3[1], min_depth, min_pos);
@@ -167,16 +185,17 @@ void get_closest_pixel_velocity_3x3(in uvec2 group_pos, uvec2 group_top_left, ou
 	depth_test_min(group_pos + kOffsets3x3[8], min_depth, min_pos);
 
 	// Velocity out
-	velocity = imageLoad(velocity_buffer, ivec2(group_top_left + min_pos)).xy;
+	velocity = imageLoad(velocity_buffer, ivec2(group_top_left) + min_pos).xy;
 }
 
 /*------------------------------------------------------------------------------
 							  HISTORY SAMPLING
 ------------------------------------------------------------------------------*/
 
-vec3 sample_catmull_rom_9(sampler2D stex, vec2 uv, vec2 resolution) {
+vec4 sample_catmull_rom_5(sampler2D stex, vec2 uv, vec2 resolution) {
 	// Source: https://gist.github.com/TheRealMJP/c83b8c0f46b63f3a88a5986f4fa982b1
 	// License: https://gist.github.com/TheRealMJP/bc503b0b87b643d3505d41eab8b332ae
+	// changed to 5 taps to improve performance
 
 	// We're going to sample a 4x4 grid of texels surrounding the target UV coordinate. We'll do this by rounding
 	// down the sample location to get the exact center of our "starting" texel. The starting texel will be at
@@ -210,83 +229,98 @@ vec3 sample_catmull_rom_9(sampler2D stex, vec2 uv, vec2 resolution) {
 	texPos3 /= resolution;
 	texPos12 /= resolution;
 
-	vec3 result = vec3(0.0f, 0.0f, 0.0f);
+	float w_top = w12.x * w0.y;
+	float w_left = w0.x * w12.y;
+	float w_center = w12.x * w12.y;
+	float w_right = w3.x * w12.y;
+	float w_bottom = w12.x * w3.y;
+	float w_total = w_top + w_left + w_center + w_right + w_bottom;
 
-	result += textureLod(stex, vec2(texPos0.x, texPos0.y), 0.0).xyz * w0.x * w0.y;
-	result += textureLod(stex, vec2(texPos12.x, texPos0.y), 0.0).xyz * w12.x * w0.y;
-	result += textureLod(stex, vec2(texPos3.x, texPos0.y), 0.0).xyz * w3.x * w0.y;
+	vec4 result = vec4(0.0);
+	result += textureLod(stex, vec2(texPos12.x, texPos0.y), 0.0) * w_top;
+	result += textureLod(stex, vec2(texPos0.x, texPos12.y), 0.0) * w_left;
+	result += textureLod(stex, vec2(texPos12.x, texPos12.y), 0.0) * w_center;
+	result += textureLod(stex, vec2(texPos3.x, texPos12.y), 0.0) * w_right;
+	result += textureLod(stex, vec2(texPos12.x, texPos3.y), 0.0) * w_bottom;
 
-	result += textureLod(stex, vec2(texPos0.x, texPos12.y), 0.0).xyz * w0.x * w12.y;
-	result += textureLod(stex, vec2(texPos12.x, texPos12.y), 0.0).xyz * w12.x * w12.y;
-	result += textureLod(stex, vec2(texPos3.x, texPos12.y), 0.0).xyz * w3.x * w12.y;
-
-	result += textureLod(stex, vec2(texPos0.x, texPos3.y), 0.0).xyz * w0.x * w3.y;
-	result += textureLod(stex, vec2(texPos12.x, texPos3.y), 0.0).xyz * w12.x * w3.y;
-	result += textureLod(stex, vec2(texPos3.x, texPos3.y), 0.0).xyz * w3.x * w3.y;
-
-	return max(result, 0.0f);
+	return max(result / w_total, 0.0f);
 }
 
 /*------------------------------------------------------------------------------
 							  HISTORY CLIPPING
 ------------------------------------------------------------------------------*/
 
-// Based on "Temporal Reprojection Anti-Aliasing" - https://github.com/playdeadgames/temporal
-vec3 clip_aabb(vec3 aabb_min, vec3 aabb_max, vec3 p, vec3 q) {
-	vec3 r = q - p;
-	vec3 rmax = (aabb_max - p.xyz);
-	vec3 rmin = (aabb_min - p.xyz);
+// AABB intersection using the slab method
+vec3 clip_aabb(vec3 aabb_min, vec3 aabb_max, vec3 ray_origin, vec3 ray_destination) {
+	// When using YCoCg gray surfaces are Co=Cg=0, which results in an invalid bounding box
+	aabb_min -= vec3(FLT_MIN);
+	aabb_max += vec3(FLT_MIN);
 
-	if (r.x > rmax.x + FLT_MIN) {
-		r *= (rmax.x / r.x);
-	}
-	if (r.y > rmax.y + FLT_MIN) {
-		r *= (rmax.y / r.y);
-	}
-	if (r.z > rmax.z + FLT_MIN) {
-		r *= (rmax.z / r.z);
-	}
+	vec3 direction = ray_destination - ray_origin;
 
-	if (r.x < rmin.x - FLT_MIN) {
-		r *= (rmin.x / r.x);
-	}
-	if (r.y < rmin.y - FLT_MIN) {
-		r *= (rmin.y / r.y);
-	}
-	if (r.z < rmin.z - FLT_MIN) {
-		r *= (rmin.z / r.z);
-	}
+	vec3 tMin = (aabb_min - ray_origin) / direction;
+	vec3 tMax = (aabb_max - ray_origin) / direction;
 
-	return p + r;
+	//vec3 t1 = min(tMin, tMax);
+	vec3 t2 = max(tMin, tMax);
+
+	// float tNear = max(max(t1.x, t1.y), t1.z);
+	float tFar = min(min(t2.x, t2.y), t2.z);
+	return ray_origin + direction * clamp(tFar, 0.0, 1.0);
+}
+
+vec3 to_ycocg(vec3 rgb) {
+	float Y = 0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
+	float Co = 0.5 * rgb.r - 0.5 * rgb.b;
+	float Cg = -0.25 * rgb.r + 0.5 * rgb.g - 0.25 * rgb.b;
+	return vec3(Y, Co, Cg);
+}
+
+vec3 from_ycocg(vec3 ycocg) {
+	float Y = ycocg.r;
+	float Co = ycocg.g;
+	float Cg = ycocg.b;
+
+	float r = Y + Co - Cg;
+	float g = Y + Cg;
+	float b = Y - Co - Cg;
+	return vec3(r, g, b);
 }
 
 // Clip history to the neighbourhood of the current sample
-vec3 clip_history_3x3(uvec2 group_pos, vec3 color_history, vec2 velocity_closest) {
+vec3 clip_history_3x3(ivec2 group_pos, vec3 color_history, float velocity_confidence) {
 	// Sample a 3x3 neighbourhood
-	vec3 s1 = load_color(group_pos + kOffsets3x3[0]);
-	vec3 s2 = load_color(group_pos + kOffsets3x3[1]);
-	vec3 s3 = load_color(group_pos + kOffsets3x3[2]);
-	vec3 s4 = load_color(group_pos + kOffsets3x3[3]);
-	vec3 s5 = load_color(group_pos + kOffsets3x3[4]);
-	vec3 s6 = load_color(group_pos + kOffsets3x3[5]);
-	vec3 s7 = load_color(group_pos + kOffsets3x3[6]);
-	vec3 s8 = load_color(group_pos + kOffsets3x3[7]);
-	vec3 s9 = load_color(group_pos + kOffsets3x3[8]);
+	vec3 sum = vec3(0.0);
+	vec3 sum_sq = vec3(0.0);
+	float w_total = 0.0;
+	for (int i = 0; i < 9; i++) {
+		vec3 ycocg = to_ycocg(load_color(group_pos + kOffsets3x3[i]));
+
+		// Karis anti-flicker: bright samples contribute less to mean/variance  to filter out fireflies
+		float w = 1.0 / (1.0 + ycocg.x);
+		// Karis recommends adding additional weight ot the center
+		w *= kWeights3x3[i];
+
+		sum += w * ycocg;
+		sum_sq += w * ycocg * ycocg;
+		w_total += w;
+	}
+	vec3 color_avg = sum / w_total;
+	vec3 color_avg2 = sum_sq / w_total;
 
 	// Compute min and max (with an adaptive box size, which greatly reduces ghosting)
-	vec3 color_avg = (s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9) * RPC_9;
-	vec3 color_avg2 = ((s1 * s1) + (s2 * s2) + (s3 * s3) + (s4 * s4) + (s5 * s5) + (s6 * s6) + (s7 * s7) + (s8 * s8) + (s9 * s9)) * RPC_9;
 	// Use variance clipping as described in https://developer.download.nvidia.com/gameworks/events/GDC2016/msalvi_temporal_supersampling.pdf
-	float box_size = mix(0.0f, params.variance_dynamic, smoothstep(0.02f, 0.0f, length(velocity_closest)));
+	float min_box_size = MIN_VARIANCE_BOX_SIZE_MULTIPLIER * params.variance_dynamic;
+	float box_size = mix(min_box_size, params.variance_dynamic, velocity_confidence * velocity_confidence);
 	vec3 dev = sqrt(abs(color_avg2 - (color_avg * color_avg))) * box_size;
 	vec3 color_min = color_avg - dev;
 	vec3 color_max = color_avg + dev;
 
 	// Variance clipping
-	vec3 color = clip_aabb(color_min, color_max, clamp(color_avg, color_min, color_max), color_history);
+	vec3 color = clip_aabb(color_min, color_max, color_avg, to_ycocg(color_history));
 
 	// Clamp to prevent NaNs
-	color = clamp(color, FLT_MIN, FLT_MAX);
+	color = clamp(from_ycocg(color), FLT_MIN, FLT_MAX);
 
 	return color;
 }
@@ -303,7 +337,7 @@ float luminance(vec3 color) {
 
 // This is "velocity disocclusion" as described by https://www.elopezr.com/temporal-aa-and-the-quest-for-the-holy-trail/.
 // We use texel space, so our scale and threshold differ.
-float get_factor_disocclusion(vec2 uv_reprojected, vec2 velocity) {
+float get_factor_velocity_disocclusion(vec2 uv_reprojected, vec2 velocity) {
 	vec2 velocity_previous = imageLoad(last_velocity_buffer, ivec2(uv_reprojected * params.resolution)).xy;
 	vec2 velocity_texels = velocity * params.resolution;
 	vec2 prev_velocity_texels = velocity_previous * params.resolution;
@@ -311,44 +345,63 @@ float get_factor_disocclusion(vec2 uv_reprojected, vec2 velocity) {
 	return clamp(disocclusion * DISOCCLUSION_SCALE, 0.0, 1.0);
 }
 
-vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_screen, vec2 uv, sampler2D tex_history) {
+// 5-tap (cross) neighborhood average
+// Used as a first-frame fallback on disocclusion so we don't output a raw aliased sample
+vec3 fallback_neighborhood_avg(ivec2 pos_group) {
+	vec3 avg = load_color(pos_group);
+	avg += load_color(pos_group + ivec2(-1, 0));
+	avg += load_color(pos_group + ivec2(1, 0));
+	avg += load_color(pos_group + ivec2(0, -1));
+	avg += load_color(pos_group + ivec2(0, 1));
+	return avg * 0.2;
+}
+
+vec4 temporal_antialiasing(uvec2 pos_group_top_left, ivec2 pos_group, uvec2 pos_screen, vec2 uv, sampler2D tex_history, out vec2 velocity) {
 	// Get the velocity of the current pixel
-	vec2 velocity = imageLoad(velocity_buffer, ivec2(pos_screen)).xy;
+	// dilate velocity buffer for good velocity on geometry edges
+	get_closest_pixel_velocity_3x3(pos_group, pos_group_top_left, velocity);
 
 	// Get reprojected uv
 	vec2 uv_reprojected = uv + velocity;
 
-	// Get input color
+	// Get input color (LDS holds reinhard colors!)
 	vec3 color_input = load_color(pos_group);
 
 	// Get history color (catmull-rom reduces a lot of the blurring that you get under motion)
-	vec3 color_history = sample_catmull_rom_9(tex_history, uv_reprojected, params.resolution).rgb;
+	vec4 history_sample = sample_catmull_rom_5(tex_history, uv_reprojected, params.resolution);
+	vec3 color_history = reinhard(history_sample.rgb);
+	float prev_accum_count = history_sample.a;
+
+	// Confidence for motion-adaptive AABB box size: 1 at rest, 0 in motion
+	// see intel https://github.com/GameTechDev/TAA/blob/main/MiniEngine/Core/Shaders/TAAResolve.hlsl
+	float velocity_confidence = clamp(1.0 - length(velocity) / VELOCITY_CONFIDENCE_DISTANCE, 0.0, 1.0);
 
 	// Clip history to the neighbourhood of the current sample (fixes a lot of the ghosting).
-	vec2 velocity_closest = vec2(0.0); // This is best done by using the velocity with the closest depth.
-	get_closest_pixel_velocity_3x3(pos_group, pos_group_top_left, velocity_closest);
-	color_history = clip_history_3x3(pos_group, color_history, velocity_closest);
+	color_history = clip_history_3x3(pos_group, color_history, velocity_confidence);
 
-	// Compute blend factor
-	float blend_factor = RPC_16; // We want to be able to accumulate as many jitter samples as we generated, that is, 16.
+	// Compute reset factor
+	float reset_factor;
 	{
 		// If re-projected UV is out of screen, converge to current color immediately.
 		float factor_screen = any(lessThan(uv_reprojected, vec2(0.0))) || any(greaterThan(uv_reprojected, vec2(1.0))) ? 1.0 : 0.0;
 
-		// Increase blend factor when there is disocclusion (fixes a lot of the remaining ghosting).
-		float factor_disocclusion = get_factor_disocclusion(uv_reprojected, velocity);
-
-		// Add to the blend factor
-		blend_factor = clamp(blend_factor + factor_screen + factor_disocclusion, 0.0, 1.0);
+		float factor_velocity_disocclusion = get_factor_velocity_disocclusion(uv_reprojected, velocity);
+		reset_factor = clamp(factor_screen + factor_velocity_disocclusion, 0.0, 1.0);
 	}
+
+	// On reset we will fall back to color_input, which is a single aliased sample
+	// If a reset is happening blend in an average of the neighborhood to avoid shimmer & aliasing
+	color_input = mix(color_input, fallback_neighborhood_avg(pos_group), reset_factor * 0.5);
+
+	// reset decays the accumulated sample count smoothly
+	prev_accum_count *= (1.0 - reset_factor);
+
+	// equal weight blend to ensuzre full history and current contribute equally (history limited by MAX_ACCUMULATED_SAMPLES)
+	float blend_factor = 1.0 / (prev_accum_count + 1.0);
 
 	// Resolve
 	vec3 color_resolved = vec3(0.0);
 	{
-		// Tonemap
-		color_history = reinhard(color_history);
-		color_input = reinhard(color_input);
-
 		// Reduce flickering
 		float lum_color = luminance(color_input);
 		float lum_history = luminance(color_history);
@@ -356,6 +409,7 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 		diff = 1.0 - diff;
 		diff = diff * diff;
 		blend_factor = mix(0.0, blend_factor, diff);
+		blend_factor = clamp(blend_factor + reset_factor, 0.0, 1.0);
 
 		// Lerp/blend
 		color_resolved = mix(color_history, color_input, blend_factor);
@@ -364,7 +418,8 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 		color_resolved = reinhard_inverse(color_resolved);
 	}
 
-	return color_resolved;
+	float new_accum_count = min(prev_accum_count + 1.0, MAX_ACCUMULATED_SAMPLES);
+	return vec4(color_resolved, new_accum_count);
 }
 
 void main() {
@@ -375,11 +430,14 @@ void main() {
 		return;
 	}
 
-	const uvec2 pos_group = gl_LocalInvocationID.xy;
+	const ivec2 pos_group = ivec2(gl_LocalInvocationID.xy);
 	const uvec2 pos_group_top_left = gl_WorkGroupID.xy * kGroupSize - kBorderSize;
 	const uvec2 pos_screen = gl_GlobalInvocationID.xy;
 	const vec2 uv = (gl_GlobalInvocationID.xy + 0.5f) / params.resolution;
 
-	vec3 result = temporal_antialiasing(pos_group_top_left, pos_group, pos_screen, uv, history_buffer);
-	imageStore(output_buffer, ivec2(gl_GlobalInvocationID.xy), vec4(result, 1.0));
+	vec2 velocity;
+	vec4 result = temporal_antialiasing(pos_group_top_left, pos_group, pos_screen, uv, history_buffer, velocity);
+
+	imageStore(output_buffer, ivec2(gl_GlobalInvocationID.xy), result);
+	imageStore(output_prev_velocity_buffer, ivec2(gl_GlobalInvocationID.xy), vec4(velocity, 0.0, 0.0));
 }
